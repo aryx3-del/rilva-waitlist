@@ -60,13 +60,16 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
     const data = body?.data && typeof body.data === 'object' ? body.data : {};
     const allowed = new Set(['getMyDatingProfile','listDateReflections','getLearningInsights','saveDatingProfile','findMatches','listMyMatches','getMatchChemistry','recordDatingPass','sendDatingLike','saveDateReflection','setNearbyPreference','setDiscoveryEnabled','getNearbyPulse','deleteDateReflection']);
     if (!allowed.has(action)) return reply({ error: { message: 'Unknown Rilva feature.' } }, 400);
+    let stage = 'firebase-init';
     try {
       const { auth, db, FieldValue, Timestamp } = await createFirebase(env);
+      stage = 'verify-token';
       const user = await auth.verifyIdToken(token, true);
       if (!user.email_verified) throw httpError(403, 'Verify your email before continuing.');
       const uid = user.uid;
       const profileRef = db.doc(`datingProfiles/${uid}`);
       const rate = async (key, limit, windowMs) => {
+        stage = `rate-limit:${key}`;
         const ref = db.doc(`featureRate/${uid}_${key}`);
         await db.runTransaction(async tx => {
           const snap = await tx.get(ref); const t = now(); const prior = snap.get('windowStart')?.toMillis?.() || 0;
@@ -82,6 +85,7 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
       let result;
       switch (action) {
         case 'getMyDatingProfile': {
+          stage = 'read-profile';
           const snap = await profileRef.get(); result = { profile: snap.exists ? snap.data() : null }; break;
         }
         case 'saveDatingProfile': {
@@ -92,7 +96,8 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
           if (!Number.isInteger(minAge) || !Number.isInteger(maxAge) || minAge < 18 || maxAge > 100 || minAge > maxAge || age < minAge || age > maxAge) throw httpError(400,'Choose an age range that includes your age and starts at 18 or above.');
           if (!intents.has(data.intention) || !paces.has(data.pace)) throw httpError(400,'Choose a valid intention and pace.');
           if (!Array.isArray(data.interests) || data.interests.length > 12 || data.interests.some(x => typeof x !== 'string' || x.trim().length < 2 || x.trim().length > 32)) throw httpError(400,'Add up to 12 interests, each 2–32 characters.');
-          await rate('profile',10,3600000); const prior = await profileRef.get();
+          await rate('profile',10,3600000); stage = 'save-profile:read-existing'; const prior = await profileRef.get();
+          stage = 'save-profile:write';
           await profileRef.set({ name, age, city, cityKey: city.normalize('NFKC').toLocaleLowerCase('en-IN'), bio, gender: data.gender, lookingFor: [...new Set(data.lookingFor)], minAge, maxAge, intention: data.intention, pace: data.pace, interests: [...new Set(data.interests.map(x => x.trim()))], discoveryEnabled: data.discoveryEnabled === true, createdAt: prior.get('createdAt') || FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
           result = { saved: true, discoverable: data.discoveryEnabled === true }; break;
         }
@@ -164,7 +169,7 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
       return reply({ data: result });
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : error?.code === 'auth/id-token-revoked' || error?.code === 'auth/invalid-id-token' ? 401 : 500;
-      if (status >= 500) console.error('Rilva API request failed:', error?.code || error?.name || 'unknown');
+      if (status >= 500) console.error('Rilva API request failed:', JSON.stringify({ action, stage, code: error?.code ?? null, name: error?.name || 'unknown' }));
       return reply({ error: { message: status >= 500 ? 'Rilva could not complete that request right now. Try again shortly.' : error.message } }, status);
     }
   };
