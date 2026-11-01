@@ -69,12 +69,14 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
       const uid = user.uid;
       const profileRef = db.doc(`datingProfiles/${uid}`);
       const rate = async (key, limit, windowMs) => {
-        stage = `rate-limit:${key}`;
+        stage = `rate-limit:${key}:begin`;
         const ref = db.doc(`featureRate/${uid}_${key}`);
         await db.runTransaction(async tx => {
+          stage = `rate-limit:${key}:read`;
           const snap = await tx.get(ref); const t = now(); const prior = snap.get('windowStart')?.toMillis?.() || 0;
           const count = t - prior < windowMs ? (snap.get('count') || 0) : 0;
           if (count >= limit) throw httpError(429, 'Please wait a little before trying again.');
+          stage = `rate-limit:${key}:commit`;
           tx.set(ref, { windowStart: Timestamp.fromMillis(count ? prior : t), count: count + 1 });
         });
       };
@@ -169,7 +171,8 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
       return reply({ data: result });
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : error?.code === 'auth/id-token-revoked' || error?.code === 'auth/invalid-id-token' ? 401 : 500;
-      if (status >= 500) console.error('Rilva API request failed:', JSON.stringify({ action, stage, code: error?.code ?? null, name: error?.name || 'unknown' }));
+      const redact = value => String(value || '').replace(/[A-Za-z0-9_-]{20,}/g, '[redacted]').slice(0, 160);
+      if (status >= 500) console.error('Rilva API request failed:', JSON.stringify({ action, stage, code: error?.code ?? null, name: error?.name || 'unknown', details: redact(error?.details), message: redact(error?.message) }));
       return reply({ error: { message: status >= 500 ? 'Rilva could not complete that request right now. Try again shortly.' : error.message } }, status);
     }
   };
