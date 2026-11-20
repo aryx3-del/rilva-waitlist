@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import { normalizeProfile, validateProfile } from '../../shared/dating-profile.mjs';
+import { chatActions, handleChat } from './lib/chat.mjs';
+import { notificationActions, handleNotifications, deliverNotification, queueNotification } from './lib/notifications.mjs';
 
 const genders = new Set(['woman', 'man', 'nonbinary']);
 const intents = new Set(['Meaningful', 'Exploring', 'Meeting people']);
@@ -27,7 +30,7 @@ function matchId(a, b) { return createHash('sha256').update([a, b].sort().join('
 function validUid(value) { return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value); }
 function iso(value) { return value?.toDate?.().toISOString?.() || (value instanceof Date ? value.toISOString() : null); }
 
-async function createFirebase(env) {
+export async function createFirebase(env) {
   if (!env.FIREBASE_SERVICE_ACCOUNT_JSON) throw httpError(503, 'Dating features are not configured yet. Add the Firebase service account to Netlify environment variables.');
   let credential;
   try { credential = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON); }
@@ -35,11 +38,14 @@ async function createFirebase(env) {
   const [{ initializeApp, cert, getApps }, { getAuth }, { getFirestore, FieldValue, Timestamp }] = await Promise.all([
     import('firebase-admin/app'), import('firebase-admin/auth'), import('firebase-admin/firestore'),
   ]);
-  const app = getApps()[0] || initializeApp({ credential: cert(credential), projectId: env.FIREBASE_PROJECT_ID || credential.project_id });
-  return { auth: getAuth(app), db: getFirestore(app), FieldValue, Timestamp };
+  const projectId = (env.FIREBASE_PROJECT_ID || credential.project_id || '').trim();
+  const databaseId = (env.FIREBASE_DATABASE_ID || '(default)').trim();
+  const appName = `rilva-api:${projectId}`;
+  const app = getApps().find(item => item.name === appName) || initializeApp({ credential: cert(credential), projectId }, appName);
+  return { auth: getAuth(app), db: databaseId === '(default)' ? getFirestore(app) : getFirestore(app, databaseId), FieldValue, Timestamp };
 }
 
-export function createHandler({ env = process.env, now = Date.now } = {}) {
+export function createHandler({ env = process.env, now = Date.now, firebaseFactory = createFirebase } = {}) {
   const bursts = new Map();
   const origins = new Set((env.RILVA_ALLOWED_ORIGINS || 'https://rilva-date.web.app,https://rilva-date.firebaseapp.com,https://rilva.date,http://localhost:800,http://localhost:8000,http://localhost:8888').split(',').map(x => x.trim()).filter(Boolean));
   if (env.URL) origins.add(env.URL);
@@ -59,20 +65,19 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
     const action = body?.action;
     const data = body?.data && typeof body.data === 'object' ? body.data : {};
     const allowed = new Set(['getMyDatingProfile','listDateReflections','getLearningInsights','saveDatingProfile','findMatches','listMyMatches','getMatchChemistry','recordDatingPass','sendDatingLike','saveDateReflection','setNearbyPreference','setDiscoveryEnabled','getNearbyPulse','deleteDateReflection']);
-    if (!allowed.has(action)) return reply({ error: { message: 'Unknown Rilva feature.' } }, 400);
+    if (!allowed.has(action) && !chatActions.includes(action) && !notificationActions.includes(action)) return reply({ error: { message: 'Unknown Rilva feature.' } }, 400);
     let stage = 'firebase-init';
     try {
-      const { auth, db, FieldValue, Timestamp } = await createFirebase(env);
+      const { auth, db, FieldValue, Timestamp } = await firebaseFactory(env);
       stage = 'verify-token';
       const user = await auth.verifyIdToken(token, true);
       if (!user.email_verified) throw httpError(403, 'Verify your email before continuing.');
       const uid = user.uid;
       const profileRef = db.doc(`datingProfiles/${uid}`);
       const rate = async (key, limit, windowMs) => {
-        stage = `rate-limit:${key}:begin`;
+        stage = `rate-limit:${key}:read`;
         const ref = db.doc(`featureRate/${uid}_${key}`);
         await db.runTransaction(async tx => {
-          stage = `rate-limit:${key}:read`;
           const snap = await tx.get(ref); const t = now(); const prior = snap.get('windowStart')?.toMillis?.() || 0;
           const count = t - prior < windowMs ? (snap.get('count') || 0) : 0;
           if (count >= limit) throw httpError(429, 'Please wait a little before trying again.');
@@ -84,22 +89,37 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
         const [a, b] = await Promise.all([db.doc(`users/${uid}/blocks/${other}`).get(), db.doc(`users/${other}/blocks/${uid}`).get()]);
         return a.exists || b.exists;
       };
+      const finish = async result => {
+        const { notificationEventIds = [], ...data } = result;
+        // Provider delivery cannot turn an already committed message into an
+        // API failure; the scheduled worker retries the durable event.
+        await Promise.all(notificationEventIds.map(eventId => deliverNotification({ db, eventId, env, now }).catch(() => null)));
+        return reply({ data });
+      };
+      if (notificationActions.includes(action)) return reply({ data: await handleNotifications({ action, data, uid, db, rate, now }) });
+      if (chatActions.includes(action)) {
+        stage = `chat:${action}`;
+        const result = await handleChat({ action, data, uid, db, FieldValue, rate, now, pushEnabled: env.RILVA_PUSH_ENABLED === 'true' });
+        return finish(result);
+      }
       let result;
       switch (action) {
         case 'getMyDatingProfile': {
-          stage = 'read-profile';
           const snap = await profileRef.get(); result = { profile: snap.exists ? snap.data() : null }; break;
         }
         case 'saveDatingProfile': {
+          Object.assign(data, normalizeProfile(data));
+          const validation = validateProfile(data);
+          if (validation) throw httpError(400, validation);
           const name = cleanText(data.name,40,'Display name'), city = cleanText(data.city,60,'City'), bio = cleanText(data.bio || '',500,'Bio');
           const age = Number(data.age), minAge = Number(data.minAge), maxAge = Number(data.maxAge);
           if (name.length < 2 || !Number.isInteger(age) || age < 18 || age > 100) throw httpError(400,'Use a display name and confirm you are 18 or older.');
           if (!genders.has(data.gender) || !Array.isArray(data.lookingFor) || !data.lookingFor.length || data.lookingFor.length > 3 || data.lookingFor.some(g => !genders.has(g))) throw httpError(400,'Choose a valid gender and who you would like to meet.');
-          if (!Number.isInteger(minAge) || !Number.isInteger(maxAge) || minAge < 18 || maxAge > 100 || minAge > maxAge || age < minAge || age > maxAge) throw httpError(400,'Choose an age range that includes your age and starts at 18 or above.');
+          if (!Number.isInteger(minAge) || !Number.isInteger(maxAge) || minAge < 18 || maxAge > 100 || minAge > maxAge) throw httpError(400,'Choose an age range that starts at 18 or above.');
           if (!intents.has(data.intention) || !paces.has(data.pace)) throw httpError(400,'Choose a valid intention and pace.');
           if (!Array.isArray(data.interests) || data.interests.length > 12 || data.interests.some(x => typeof x !== 'string' || x.trim().length < 2 || x.trim().length > 32)) throw httpError(400,'Add up to 12 interests, each 2–32 characters.');
-          await rate('profile',10,3600000); stage = 'save-profile:read-existing'; const prior = await profileRef.get();
-          stage = 'save-profile:write';
+          await rate('profile',10,3600000); stage = 'profile:read'; const prior = await profileRef.get();
+          stage = 'profile:write';
           await profileRef.set({ name, age, city, cityKey: city.normalize('NFKC').toLocaleLowerCase('en-IN'), bio, gender: data.gender, lookingFor: [...new Set(data.lookingFor)], minAge, maxAge, intention: data.intention, pace: data.pace, interests: [...new Set(data.interests.map(x => x.trim()))], discoveryEnabled: data.discoveryEnabled === true, createdAt: prior.get('createdAt') || FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
           result = { saved: true, discoverable: data.discoveryEnabled === true }; break;
         }
@@ -127,11 +147,13 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
         }
         case 'sendDatingLike': {
           const target = String(data.targetUid || ''); if (!validUid(target) || target === uid) throw httpError(400,'Choose a valid profile.'); await rate('like',60,86400000);
-          const selfRef=profileRef,targetRef=db.doc(`datingProfiles/${target}`),out=db.doc(`datingLikes/${uid}/outgoing/${target}`),seen=db.doc(`datingLikes/${uid}/seen/${target}`),incoming=db.doc(`datingLikes/${target}/outgoing/${uid}`),matchRef=db.doc(`matches/${matchId(uid,target)}`); let matched=false;
+          const selfRef=profileRef,targetRef=db.doc(`datingProfiles/${target}`),out=db.doc(`datingLikes/${uid}/outgoing/${target}`),seen=db.doc(`datingLikes/${uid}/seen/${target}`),incoming=db.doc(`datingLikes/${target}/outgoing/${uid}`),matchRef=db.doc(`matches/${matchId(uid,target)}`); let matched=false, notificationEventIds=[];
           await db.runTransaction(async tx=>{ const [s,t,ib,ob,like,existing]=await Promise.all([tx.get(selfRef),tx.get(targetRef),tx.get(db.doc(`users/${uid}/blocks/${target}`)),tx.get(db.doc(`users/${target}/blocks/${uid}`)),tx.get(incoming),tx.get(matchRef)]);
+            notificationEventIds = [];
+            if(existing.exists && existing.get('state') !== 'active') throw httpError(412,'This connection has ended.');
             if(!s.exists||!t.exists||!s.get('discoveryEnabled')||!t.get('discoveryEnabled')||!mutualPreference(s.data(),t.data()))throw httpError(412,'This profile is no longer available for a match.'); if(ib.exists||ob.exists)throw httpError(403,'This profile is unavailable.');
-            tx.set(out,{createdAt:FieldValue.serverTimestamp()});tx.set(seen,{action:'liked',createdAt:FieldValue.serverTimestamp()});if(like.exists||existing.exists){matched=true;if(!existing.exists)tx.create(matchRef,{memberUids:[uid,target],state:'active',createdAt:FieldValue.serverTimestamp(),chemistryUpdatedAt:null});}
-          }); result={matched,matchId:matched?matchRef.id:null};break;
+            tx.set(out,{createdAt:FieldValue.serverTimestamp()});tx.set(seen,{action:'liked',createdAt:FieldValue.serverTimestamp()});if(like.exists||existing.exists){matched=true;if(!existing.exists){tx.create(matchRef,{memberUids:[uid,target],state:'active',createdAt:FieldValue.serverTimestamp(),chemistryUpdatedAt:null});if(env.RILVA_PUSH_ENABLED === 'true')for(const recipient of [uid,target]){const eventId=`${matchRef.id}_match_${recipient}`;queueNotification(tx,db,{eventId,matchId:matchRef.id,recipient,kind:'match',now});notificationEventIds.push(eventId);}}}
+          }); result={matched,matchId:matched?matchRef.id:null,notificationEventIds};break;
         }
         case 'getMatchChemistry': {
           await rate('chemistry',20,60000); const id=String(data.matchId||''); if(!/^[a-f0-9]{40}$/.test(id))throw httpError(400,'Choose a valid match.'); const ref=db.doc(`matches/${id}`),m=await ref.get(),members=m.get('memberUids')||[];
@@ -168,11 +190,10 @@ export function createHandler({ env = process.env, now = Date.now } = {}) {
           result={city:p.city,newMembersThisWeek:snap.size===500?`${count}+`:count,asOf:new Date(now()).toISOString(),note:'City-level count only. No exact location or member identity is shared.'};break;
         }
       }
-      return reply({ data: result });
+      return finish(result);
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : error?.code === 'auth/id-token-revoked' || error?.code === 'auth/invalid-id-token' ? 401 : 500;
-      const redact = value => String(value || '').replace(/[A-Za-z0-9_-]{20,}/g, '[redacted]').slice(0, 160);
-      if (status >= 500) console.error('Rilva API request failed:', JSON.stringify({ action, stage, code: error?.code ?? null, name: error?.name || 'unknown', details: redact(error?.details), message: redact(error?.message) }));
+      if (status >= 500) console.error('Rilva API request failed:', JSON.stringify({ action, stage, code: error?.code || 'unknown', projectId: (env.FIREBASE_PROJECT_ID || '').trim(), databaseId: (env.FIREBASE_DATABASE_ID || '(default)').trim() }));
       return reply({ error: { message: status >= 500 ? 'Rilva could not complete that request right now. Try again shortly.' : error.message } }, status);
     }
   };
