@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { normalizeProfile, validateProfile } from '../../shared/dating-profile.mjs';
 import { chatActions, handleChat } from './lib/chat.mjs';
 import { safetyActions, handleSafety } from './lib/safety.mjs';
+import { readApiPayload } from './lib/request.mjs';
 import { notificationActions, handleNotifications, deliverNotification, queueNotification } from './lib/notifications.mjs';
 
 const genders = new Set(['woman', 'man', 'nonbinary']);
@@ -62,7 +63,8 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
     const token = request.headers.get('authorization')?.match(/^Bearer ([^\s]+)$/)?.[1];
     if (!token || token.length > 4096) return reply({ error: { message: 'Sign in to use Rilva.' } }, 401);
     let body;
-    try { body = await request.json(); } catch { return reply({ error: { message: 'Send a valid JSON request.' } }, 400); }
+    try { body = await readApiPayload(request); }
+    catch (error) { return reply({ error: { message: error.message } }, error.status || 400); }
     const action = body?.action;
     const data = body?.data && typeof body.data === 'object' ? body.data : {};
     const allowed = new Set(['getMyDatingProfile','listDateReflections','getLearningInsights','saveDatingProfile','findMatches','listMyMatches','getMatchChemistry','recordDatingPass','sendDatingLike','saveDateReflection','setNearbyPreference','setDiscoveryEnabled','getNearbyPulse','deleteDateReflection']);
@@ -81,7 +83,7 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
         await db.runTransaction(async tx => {
           const snap = await tx.get(ref); const t = now(); const prior = snap.get('windowStart')?.toMillis?.() || 0;
           const count = t - prior < windowMs ? (snap.get('count') || 0) : 0;
-          if (count >= limit) throw httpError(429, 'Please wait a little before trying again.');
+          if (count >= limit) throw Object.assign(httpError(429, 'Please wait a little before trying again.'), { retryAfter: Math.max(1, Math.ceil((prior + windowMs - t) / 1000)) });
           stage = `rate-limit:${key}:commit`;
           tx.set(ref, { windowStart: Timestamp.fromMillis(count ? prior : t), count: count + 1 });
         });
@@ -110,6 +112,7 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
       let result;
       switch (action) {
         case 'getMyDatingProfile': {
+          await rate('profile-read',30,60000);
           const snap = await profileRef.get(); result = { profile: snap.exists ? snap.data() : null }; break;
         }
         case 'saveDatingProfile': {
@@ -133,6 +136,7 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
         }
         case 'setDiscoveryEnabled': case 'setNearbyPreference': {
           if (typeof data.enabled !== 'boolean') throw httpError(400,'Choose whether this setting is enabled.');
+          await rate('profile-settings',30,60000);
           const ref = profileRef; if (!(await ref.get()).exists) throw httpError(412, action === 'setNearbyPreference' ? 'Save your dating profile first.' : 'Create your dating profile first.');
           const key = action === 'setNearbyPreference' ? 'nearbyEnabled' : 'discoveryEnabled'; await ref.set({ [key]: data.enabled, updatedAt: FieldValue.serverTimestamp() }, { merge: true }); result = { enabled: data.enabled }; break;
         }
@@ -181,18 +185,20 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
         case 'saveDateReflection': {
           const reflection=cleanText(data.reflection||'',1200,'Reflection'),takeaway=cleanText(data.takeaway||'',600,'Takeaway'),rating=Number(data.rating),paceFit=data.paceFit;
           if(!Number.isInteger(rating)||rating<1||rating>5||!paceFits.has(paceFit))throw httpError(400,'Choose a date rating and how the pace felt.');if(!reflection&&!takeaway)throw httpError(400,'Add a reflection or takeaway before saving.');
+          await rate('reflection-write',30,3600000);
           const match=data.matchId?String(data.matchId):null;if(match&&!/^[a-f0-9]{40}$/.test(match))throw httpError(400,'Choose a valid match.');if(match){const m=await db.doc(`matches/${match}`).get();if(!m.exists||!m.get('memberUids')?.includes(uid))throw httpError(403,'That match is unavailable.');}
           const supplied=String(data.id||'');if(supplied&&!/^[A-Za-z0-9_-]{10,40}$/.test(supplied))throw httpError(400,'Choose a valid note.');const col=db.collection(`users/${uid}/dateReflections`),ref=supplied?col.doc(supplied):col.doc();
           await ref.set({reflection,takeaway,rating,paceFit,matchId:match,updatedAt:FieldValue.serverTimestamp(),...(supplied?{}:{createdAt:FieldValue.serverTimestamp()})},{merge:true});result={saved:true,id:ref.id};break;
         }
         case 'listDateReflections': case 'getLearningInsights': {
+          await rate(action==='getLearningInsights'?'learning':'reflection-read',action==='getLearningInsights'?20:30,60000);
           const snap=await db.collection(`users/${uid}/dateReflections`).orderBy('createdAt','desc').limit(30).get(),rows=snap.docs.map(d=>({id:d.id,reflection:d.get('reflection')||'',takeaway:d.get('takeaway')||'',rating:d.get('rating')||null,paceFit:d.get('paceFit')||null,createdAt:iso(d.get('createdAt'))}));
-          if(action==='listDateReflections'){result={reflections:rows};break;} await rate('learning',20,60000);const valid=rows.filter(x=>Number.isInteger(x.rating)&&paceFits.has(x.paceFit));
+          if(action==='listDateReflections'){result={reflections:rows};break;} const valid=rows.filter(x=>Number.isInteger(x.rating)&&paceFits.has(x.paceFit));
           if(valid.length<2)result={totalDates:valid.length,ready:false,insight:'After a couple more reflections, Rilva can help you spot patterns in the pace and connection that feel right to you.'};
           else{const averageRating=Math.round(valid.reduce((s,x)=>s+x.rating,0)/valid.length*10)/10,counts=valid.reduce((c,x)=>({...c,[x.paceFit]:(c[x.paceFit]||0)+1}),{}),[pace,count]=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0],phrase={'too-fast':'slower introductions',right:'a pace that feels right','too-slow':'more direct momentum'}[pace];result={totalDates:valid.length,ready:true,averageRating,commonPace:pace,count,insight:`Across your last ${valid.length} reflections, you most often noted ${phrase} (${count} times). Your average connection rating was ${averageRating}/5. Use this as a prompt for your own preferences—not a rule for judging future dates.`};}break;
         }
         case 'deleteDateReflection': {
-          const id=String(data.id||'');if(!/^[A-Za-z0-9_-]{10,40}$/.test(id))throw httpError(400,'Choose a valid note.');await db.doc(`users/${uid}/dateReflections/${id}`).delete();result={deleted:true};break;
+          const id=String(data.id||'');if(!/^[A-Za-z0-9_-]{10,40}$/.test(id))throw httpError(400,'Choose a valid note.');await rate('reflection-write',30,3600000);await db.doc(`users/${uid}/dateReflections/${id}`).delete();result={deleted:true};break;
         }
         case 'getNearbyPulse': {
           await rate('nearby',12,60000);const p=(await profileRef.get()).data();if(!p?.city)throw httpError(412,'Save your city in your dating profile first.');if(p.nearbyEnabled!==true)throw httpError(412,'Enable nearby activity first.');
@@ -202,9 +208,10 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
       }
       return finish(result);
     } catch (error) {
-      const status = Number.isInteger(error?.status) ? error.status : error?.code === 'auth/id-token-revoked' || error?.code === 'auth/invalid-id-token' ? 401 : 500;
+      const invalidSession = new Set(['auth/id-token-expired','auth/id-token-revoked','auth/invalid-id-token','auth/argument-error','auth/user-disabled','auth/user-not-found']).has(error?.code);
+      const status = Number.isInteger(error?.status) ? error.status : invalidSession ? 401 : 500;
       if (status >= 500) console.error('Rilva API request failed:', JSON.stringify({ action, stage, code: error?.code || 'unknown', projectId: (env.FIREBASE_PROJECT_ID || '').trim(), databaseId: (env.FIREBASE_DATABASE_ID || '(default)').trim() }));
-      return reply({ error: { message: status >= 500 ? 'Rilva could not complete that request right now. Try again shortly.' : error.message } }, status);
+      return reply({ error: { message: invalidSession ? 'Your session is no longer valid. Sign in again.' : status >= 500 ? 'Rilva could not complete that request right now. Try again shortly.' : error.message } }, status, status === 429 ? { 'retry-after': String(error.retryAfter || 60) } : {});
     }
   };
 }
