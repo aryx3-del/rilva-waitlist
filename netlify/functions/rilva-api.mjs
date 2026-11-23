@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { normalizeProfile, validateProfile } from '../../shared/dating-profile.mjs';
 import { chatActions, handleChat } from './lib/chat.mjs';
+import { safetyActions, handleSafety } from './lib/safety.mjs';
 import { notificationActions, handleNotifications, deliverNotification, queueNotification } from './lib/notifications.mjs';
 
 const genders = new Set(['woman', 'man', 'nonbinary']);
@@ -65,7 +66,7 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
     const action = body?.action;
     const data = body?.data && typeof body.data === 'object' ? body.data : {};
     const allowed = new Set(['getMyDatingProfile','listDateReflections','getLearningInsights','saveDatingProfile','findMatches','listMyMatches','getMatchChemistry','recordDatingPass','sendDatingLike','saveDateReflection','setNearbyPreference','setDiscoveryEnabled','getNearbyPulse','deleteDateReflection']);
-    if (!allowed.has(action) && !chatActions.includes(action) && !notificationActions.includes(action)) return reply({ error: { message: 'Unknown Rilva feature.' } }, 400);
+    if (!allowed.has(action) && !chatActions.includes(action) && !notificationActions.includes(action) && !safetyActions.includes(action)) return reply({ error: { message: 'Unknown Rilva feature.' } }, 400);
     let stage = 'firebase-init';
     try {
       const { auth, db, FieldValue, Timestamp } = await firebaseFactory(env);
@@ -97,6 +98,10 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
         return reply({ data });
       };
       if (notificationActions.includes(action)) return reply({ data: await handleNotifications({ action, data, uid, db, rate, now }) });
+      if (safetyActions.includes(action)) {
+        stage = `safety:${action}`;
+        return reply({ data: await handleSafety({ action, data, uid, db, FieldValue, rate }) });
+      }
       if (chatActions.includes(action)) {
         stage = `chat:${action}`;
         const result = await handleChat({ action, data, uid, db, FieldValue, rate, now, pushEnabled: env.RILVA_PUSH_ENABLED === 'true' });
@@ -118,9 +123,12 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
           if (!Number.isInteger(minAge) || !Number.isInteger(maxAge) || minAge < 18 || maxAge > 100 || minAge > maxAge) throw httpError(400,'Choose an age range that starts at 18 or above.');
           if (!intents.has(data.intention) || !paces.has(data.pace)) throw httpError(400,'Choose a valid intention and pace.');
           if (!Array.isArray(data.interests) || data.interests.length > 12 || data.interests.some(x => typeof x !== 'string' || x.trim().length < 2 || x.trim().length > 32)) throw httpError(400,'Add up to 12 interests, each 2–32 characters.');
-          await rate('profile',10,3600000); stage = 'profile:read'; const prior = await profileRef.get();
-          stage = 'profile:write';
-          await profileRef.set({ name, age, city, cityKey: city.normalize('NFKC').toLocaleLowerCase('en-IN'), bio, gender: data.gender, lookingFor: [...new Set(data.lookingFor)], minAge, maxAge, intention: data.intention, pace: data.pace, interests: [...new Set(data.interests.map(x => x.trim()))], discoveryEnabled: data.discoveryEnabled === true, createdAt: prior.get('createdAt') || FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
+          await rate('profile',10,3600000);
+          await db.runTransaction(async tx => {
+            stage = 'profile:read'; const prior = await tx.get(profileRef);
+            stage = 'profile:write';
+            tx.set(profileRef, { name, age, city, cityKey: city.normalize('NFKC').toLocaleLowerCase('en-IN'), bio, gender: data.gender, lookingFor: [...new Set(data.lookingFor)], minAge, maxAge, intention: data.intention, pace: data.pace, interests: [...new Set(data.interests.map(x => x.trim()))], discoveryEnabled: data.discoveryEnabled === true, nearbyEnabled: prior.get('nearbyEnabled') === true, createdAt: prior.get('createdAt') || FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
+          });
           result = { saved: true, discoverable: data.discoveryEnabled === true }; break;
         }
         case 'setDiscoveryEnabled': case 'setNearbyPreference': {
@@ -135,6 +143,8 @@ export function createHandler({ env = process.env, now = Date.now, firebaseFacto
           for (const doc of pool.docs) {
             const other = doc.data(); if (doc.id === uid || !mutualPreference(self,other) || await blocked(doc.id)) continue;
             if ((await db.doc(`datingLikes/${uid}/seen/${doc.id}`).get()).exists) continue;
+            // Ended connections stay out of discovery even if the seen record is missing.
+            if ((await db.doc(`matches/${matchId(uid,doc.id)}`).get()).exists) continue;
             const interests = new Set((self.interests || []).map(x => x.toLocaleLowerCase('en-IN'))); const shared = (other.interests || []).filter(x => interests.has(x.toLocaleLowerCase('en-IN')));
             const reasons = []; if (shared.length) reasons.push(`${shared.length} shared interest${shared.length === 1 ? '' : 's'}`); if (self.intention === other.intention) reasons.push('similar dating intentions'); if (self.pace === other.pace) reasons.push('a similar pace'); if (self.cityKey === other.cityKey) reasons.push('same city');
             const score = Math.min(95,Math.min(40,shared.length*12)+(self.intention===other.intention?25:0)+(self.pace===other.pace?20:0)+(self.cityKey===other.cityKey?15:0)); profiles.push({ ...safeCard(doc.id,other,score,reasons), sharedInterests:shared });
